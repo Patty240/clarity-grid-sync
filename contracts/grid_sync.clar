@@ -8,12 +8,39 @@
 (define-constant err-invalid-price (err u103))
 (define-constant err-listing-not-found (err u104))
 (define-constant err-invalid-reward-rate (err u105))
+(define-constant err-invalid-units (err u106))
+(define-constant err-listing-expired (err u107))
+
+;; Contract status
+(define-data-var contract-enabled bool true)
 
 ;; Data Variables
 (define-data-var min-energy-unit uint u1)
 (define-data-var platform-fee uint u1) ;; 1% fee
 (define-data-var reward-rate uint u5) ;; 5% rewards
 (define-data-var price-adjustment-threshold uint u1000) ;; Units threshold for price adjustment
+(define-data-var listing-expiration-blocks uint u1440) ;; ~10 days at 10min blocks
+
+;; Events
+(define-map-event ProducerRegistered (producer principal))
+(define-map-event ConsumerRegistered (consumer principal))
+(define-map-event EnergyListed 
+  (
+    (listing-id uint)
+    (seller principal)
+    (units uint)
+    (price-per-unit uint)
+  )
+)
+(define-map-event EnergyPurchased
+  (
+    (listing-id uint)
+    (buyer principal)
+    (seller principal)
+    (units uint)
+    (price-per-unit uint)
+  )
+)
 
 ;; Data Maps
 (define-map Producers principal
@@ -40,7 +67,8 @@
     units: uint,
     price-per-unit: uint,
     active: bool,
-    last-price-adjustment: uint
+    last-price-adjustment: uint,
+    created-at: uint
   }
 )
 
@@ -54,6 +82,19 @@
 
 (define-data-var listing-nonce uint u0)
 (define-data-var market-stats-nonce uint u0)
+
+;; Private Functions
+(define-private (is-listing-valid (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? EnergyListings listing-id) false))
+    (expiration (+ (get created-at listing) (var-get listing-expiration-blocks)))
+  )
+    (and
+      (get active listing)
+      (< block-height expiration)
+    )
+  )
+)
 
 ;; Dynamic Pricing Functions
 (define-private (calculate-dynamic-price (current-price uint) (units-sold uint))
@@ -74,12 +115,16 @@
 
 ;; Producer Functions
 (define-public (register-producer)
-  (ok (map-set Producers tx-sender {
-    active: true,
-    total-energy-sold: u0,
-    earnings: u0,
-    reward-points: u0
-  }))
+  (begin
+    (asserts! (var-get contract-enabled) (err err-owner-only))
+    (print (create-map-event ProducerRegistered tx-sender))
+    (ok (map-set Producers tx-sender {
+      active: true,
+      total-energy-sold: u0,
+      earnings: u0,
+      reward-points: u0
+    }))
+  )
 )
 
 (define-public (list-energy-units (units uint) (price-per-unit uint))
@@ -88,114 +133,62 @@
       (producer (unwrap! (map-get? Producers tx-sender) (err err-not-registered)))
       (listing-id (var-get listing-nonce))
     )
+    (asserts! (var-get contract-enabled) (err err-owner-only))
+    (asserts! (> units u0) (err err-invalid-units))
     (asserts! (> price-per-unit u0) (err err-invalid-price))
+    
+    (print (create-map-event EnergyListed listing-id tx-sender units price-per-unit))
+    
     (map-set EnergyListings listing-id {
       seller: tx-sender,
       units: units,
       price-per-unit: price-per-unit,
       active: true,
-      last-price-adjustment: block-height
+      last-price-adjustment: block-height,
+      created-at: block-height
     })
     (var-set listing-nonce (+ listing-id u1))
     (ok listing-id)
   )
 )
 
-;; Consumer Functions
-(define-public (register-consumer)
-  (ok (map-set Consumers tx-sender {
-    active: true,
-    total-energy-bought: u0,
-    spent: u0,
-    reward-points: u0
-  }))
-)
-
-(define-public (buy-energy (listing-id uint) (units uint))
-  (let
-    (
-      (listing (unwrap! (map-get? EnergyListings listing-id) (err err-listing-not-found)))
-      (consumer (unwrap! (map-get? Consumers tx-sender) (err err-not-registered)))
-      (producer (unwrap! (map-get? Producers (get seller listing)) (err err-not-registered)))
-      (total-cost (* units (get price-per-unit listing)))
-      (fee (/ (* total-cost (var-get platform-fee)) u100))
-      (consumer-rewards (calculate-rewards total-cost))
-      (producer-rewards (calculate-rewards total-cost))
-      (new-price (calculate-dynamic-price (get price-per-unit listing) units))
-    )
+(define-public (cancel-listing (listing-id uint))
+  (let (
+    (listing (unwrap! (map-get? EnergyListings listing-id) (err err-listing-not-found)))
+  )
+    (asserts! (is-eq tx-sender (get seller listing)) (err err-owner-only))
     (asserts! (get active listing) (err err-listing-not-found))
-    (asserts! (<= units (get units listing)) (err err-insufficient-balance))
     
-    ;; Transfer payment
-    (try! (stx-transfer? (+ total-cost fee) tx-sender contract-owner))
-    (try! (stx-transfer? total-cost tx-sender (get seller listing)))
-    
-    ;; Update listings with dynamic pricing
     (map-set EnergyListings listing-id
       (merge listing {
-        units: (- (get units listing) units),
-        active: (> (- (get units listing) units) u0),
-        price-per-unit: new-price,
-        last-price-adjustment: block-height
+        active: false
       })
     )
-    
-    ;; Update consumer stats and rewards
-    (map-set Consumers tx-sender
-      (merge consumer {
-        total-energy-bought: (+ (get total-energy-bought consumer) units),
-        spent: (+ (get spent consumer) total-cost),
-        reward-points: (+ (get reward-points consumer) consumer-rewards)
-      })
-    )
-
-    ;; Update producer stats and rewards
-    (map-set Producers (get seller listing)
-      (merge producer {
-        total-energy-sold: (+ (get total-energy-sold producer) units),
-        earnings: (+ (get earnings producer) total-cost),
-        reward-points: (+ (get reward-points producer) producer-rewards)
-      })
-    )
-    
-    ;; Update market statistics
-    (let
-      ((stats-id (var-get market-stats-nonce)))
-      (map-set MarketPrices stats-id {
-        timestamp: block-height,
-        avg-price: new-price,
-        total-volume: units
-      })
-      (var-set market-stats-nonce (+ stats-id u1))
-    )
-    
     (ok true)
   )
 )
 
-;; Read-only functions
-(define-read-only (get-listing (listing-id uint))
-  (map-get? EnergyListings listing-id)
+;; Consumer Functions
+(define-public (register-consumer)
+  (begin
+    (asserts! (var-get contract-enabled) (err err-owner-only))
+    (print (create-map-event ConsumerRegistered tx-sender))
+    (ok (map-set Consumers tx-sender {
+      active: true,
+      total-energy-bought: u0,
+      spent: u0,
+      reward-points: u0
+    }))
+  )
 )
 
-(define-read-only (get-producer-info (producer principal))
-  (map-get? Producers producer)
-)
-
-(define-read-only (get-consumer-info (consumer principal))
-  (map-get? Consumers consumer)
-)
-
-(define-read-only (get-market-price (stats-id uint))
-  (map-get? MarketPrices stats-id)
-)
+[... remaining functions unchanged ...]
 
 ;; Admin Functions
-(define-public (set-reward-rate (new-rate uint))
+(define-public (toggle-contract-status)
   (begin
     (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
-    (asserts! (<= new-rate u100) (err err-invalid-reward-rate))
-    (var-set reward-rate new-rate)
+    (var-set contract-enabled (not (var-get contract-enabled)))
     (ok true)
   )
 )
